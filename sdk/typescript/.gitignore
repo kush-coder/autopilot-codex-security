@@ -1,0 +1,9 @@
+/dist/
+/_bundled_plugin/
+/.plugin-build-*/
+/node_modules
+/coverage/
+/reports/
+/.stryker-tmp/
+/private_release/dist/
+/*.tsbuildinfo

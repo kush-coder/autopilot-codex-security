@@ -1,0 +1,647 @@
+import { describe, expect, test } from "bun:test";
+import { readdir } from "node:fs/promises";
+import { scopedTemporaryDirectory } from "./support/temporary-directories.js";
+import { main } from "../src/cli.js";
+import { DEFAULT_CODEX_CONFIG, scanModelConfiguration } from "../src/config.js";
+import { DEFAULT_DEEP_SCAN_SETTINGS } from "../src/deep-scan-defaults.js";
+import { capture, dependencies } from "./cli-fixtures.js";
+import { createCliTest } from "./support/cli-run.js";
+
+async function help(args: readonly string[], columns?: number) {
+  const stdout = capture(true);
+  const stderr = capture(true);
+  const calls: string[] = [];
+  const unexpected = (name: string): never => {
+    calls.push(name);
+    throw new Error(`Help must not call ${name}.`);
+  };
+  const deps = dependencies({
+    onConfig: () => unexpected("createSecurity"),
+    onCodex: () => unexpected("runCodex"),
+    onWorkbench: () => unexpected("runWorkbench"),
+    onRepositoryCommand: () => unexpected("runRepositoryCommand"),
+    onUpdateCheck: async () => unexpected("checkForUpdate"),
+  });
+  deps.importScan = async () => unexpected("importScan");
+  const code = await main(
+    args,
+    { ...stdout.stream, ...(columns === undefined ? {} : { columns }) },
+    stderr.stream,
+    deps,
+  );
+  expect(code).toBe(0);
+  expect(stderr.text()).toBe("");
+  expect(calls).toEqual([]);
+  return stdout.text();
+}
+
+function option(helpText: string, flag: string): string {
+  const lines = helpText.split("\n");
+  const start = lines.findIndex((line) => line.startsWith(`  ${flag} `));
+  if (start === -1) return "";
+  let end = start + 1;
+  while (
+    end < lines.length &&
+    lines[end]!.trim() !== "" &&
+    !/^  --[a-z]/u.test(lines[end]!) &&
+    /^\s/u.test(lines[end]!)
+  ) {
+    end += 1;
+  }
+  return lines.slice(start, end).join(" ").replace(/\s+/gu, " ");
+}
+
+describe("CLI help", () => {
+  test.each(["scan", "patch", "verify-fix"])(
+    "%s advertises hosted mode without entering the protocol",
+    async (command) => {
+      const text = await help([command, "--host", "--help"]);
+      expect(option(text, "--host")).toContain("JSON-RPC stdin/stdout");
+      expect(option(text, "--host")).toContain("use alone");
+      if (command !== "scan") {
+        expect(option(text, "--verification-mode")).toContain("static");
+        expect(option(text, "--verification-mode")).toContain("standard");
+        const schema = JSON.parse(await help([command, "--schema", "--json"]));
+        expect(schema.options.properties.verificationMode.enum).toEqual([
+          "static",
+          "standard",
+        ]);
+      }
+    },
+  );
+
+  test("groups the common workflow ahead of setup and integrations", async () => {
+    const text = await help(["--help"]);
+    const sections = text.split(/\n(?=[A-Z][^\n]+:\n)/u);
+    const sectionFor = (command: string) =>
+      sections.findIndex((section) =>
+        new RegExp(`^  ${command} {2,}`, "mu").test(section),
+      );
+    expect(sectionFor("scan")).toBeGreaterThanOrEqual(0);
+    expect(sectionFor("patch")).toBe(sectionFor("scan"));
+    expect(sectionFor("scans")).toBeGreaterThan(sectionFor("scan"));
+    expect(sectionFor("findings")).toBe(sectionFor("scans"));
+    expect(sectionFor("login")).toBeGreaterThan(sectionFor("scan"));
+    expect(sectionFor("init")).toBe(sectionFor("login"));
+    expect(sectionFor("update")).toBe(sectionFor("login"));
+    expect(text).not.toContain("--update");
+    expect(sectionFor("completions")).toBeGreaterThan(sectionFor("scan"));
+    expect(text).toContain("Aliases: cs");
+    for (const command of [
+      "scan . --dry-run",
+      "login",
+      "scan .",
+      "scans show",
+    ]) {
+      expect(text).toContain(`  codex-security ${command}`);
+    }
+    expect(text.indexOf("codex-security scan . --dry-run")).toBeLessThan(
+      text.indexOf("codex-security login"),
+    );
+    expect(text).toContain("<command> --help");
+  });
+
+  test.each(["bulk-scan", "scan-components"])(
+    "labels %s cost limits in USD",
+    async (command) => {
+      const text = await help([command, "--help"]);
+      expect(option(text, "--max-total-cost")).toContain("<usd>");
+    },
+  );
+
+  test("shows semantic values, repeatable inputs, choices, and scan defaults", async () => {
+    const text = await help(["scan", "--help"]);
+    expect(text).toContain("Usage: codex-security scan [repository]");
+    expect(text).not.toMatch(/<(?:array|string|number)>/u);
+    expect(option(text, "--path")).toContain("<path>");
+    expect(option(text, "--path")).toMatch(/repeat/iu);
+    expect(option(text, "--codex")).toContain("<key=value>");
+    expect(option(text, "--codex")).toMatch(/repeat/iu);
+    expect(option(text, "--max-cost")).toContain("<usd>");
+    expect(option(text, "--owner-suggestions")).toContain(
+      "owner-suggestions.json",
+    );
+    expect(option(text, "--mode")).toContain("<mode>");
+    expect(option(text, "--mode")).toContain("standard");
+    expect(option(text, "--mode")).toContain("deep");
+    expect(option(text, "--provider")).toContain("amazon-bedrock");
+    for (const label of [
+      "--model <model>",
+      "--provider <provider>",
+      "--effort <effort>",
+      "--max-time-hours <hours>",
+      "--max-time <minutes>",
+    ])
+      expect(text).toContain(label);
+    const { model, reasoningEffort } =
+      scanModelConfiguration(DEFAULT_CODEX_CONFIG);
+    expect(text).toContain(model);
+    expect(text).toContain(reasoningEffort);
+    expect(text).toContain('model_reasoning_effort="high"');
+    expect(text).toContain("CODEX_SECURITY_STATE_DIR");
+    expect(text).not.toContain("openai:gpt");
+    expect(text).toContain("--path src --path tests");
+    expect(text).not.toContain("codex-security scan . --path src,tests");
+    expect(text).toMatch(
+      /^  codex-security scan \. --working-tree(?:\s+#.*)?$/mu,
+    );
+    for (const [flag, value] of [
+      ["--workers", DEFAULT_DEEP_SCAN_SETTINGS.workers],
+      ["--subagents", DEFAULT_DEEP_SCAN_SETTINGS.subagents],
+      ["--stop-after-no-new", DEFAULT_DEEP_SCAN_SETTINGS.stopAfterNoNew],
+      ["--max-discovery-runs", DEFAULT_DEEP_SCAN_SETTINGS.maxDiscoveryRuns],
+    ] as const) {
+      expect(option(text, flag)).toContain("<count>");
+      expect(option(text, flag)).toMatch(
+        new RegExp(`default: ${value}\\b`, "iu"),
+      );
+    }
+  });
+
+  test("uses bare booleans in copyable publish examples", async () => {
+    const publish = await help(["publish", "scan", "--help"]);
+    expect(publish).not.toMatch(/--dry-run true\b/u);
+    expect(publish).toMatch(
+      /^  codex-security publish scan .*--dry-run(?:\s+#.*)?$/mu,
+    );
+  });
+
+  test.each([
+    { command: ["scan"] },
+    { command: ["scan", "import"] },
+    { command: ["scans", "rerun"] },
+    { command: ["scans", "resume"] },
+  ])("advertises supported formats for $command", async ({ command }) => {
+    const text = await help([...command, "--help"]);
+    const format = option(text, "--format");
+    expect(format).toContain("json");
+    expect(format).not.toMatch(/\bmd\b/u);
+    if (command[0] === "scan") {
+      expect(option(text, "--filter-output")).toBe("");
+    }
+  });
+
+  test.each(["validate", "login", "logout"])(
+    "%s does not promise unsupported JSON command output",
+    async (command) => {
+      const text = await help([command, "--help"]);
+      expect(option(text, "--format")).not.toMatch(/\bjsonl?\b/u);
+      expect(option(text, "--json")).toBe("");
+      const schema = JSON.parse(await help([command, "--schema", "--json"]));
+      expect(schema).toEqual(expect.any(Object));
+    },
+  );
+
+  test("documents optional validation context and structured output", async () => {
+    const text = await help(["validate", "--help"]);
+    expect(option(text, "--context")).toContain("<text>");
+    expect(option(text, "--context-file")).toContain("<file>");
+    expect(option(text, "--knowledge-base")).toContain("<path>");
+    expect(option(text, "--knowledge-base")).toMatch(/repeat/iu);
+    expect(option(text, "--output-schema")).toContain("<file>");
+  });
+
+  test("documents raw export formats without promising output transforms", async () => {
+    const text = await help(["export", "--help"]);
+    expect(text).toContain("Usage: codex-security export [scan-dir]");
+    expect(text).toContain("--artifact <artifact>");
+    expect(text).toContain("--scan <scan-id>");
+    expect(text).toContain("--source-root <path>");
+    expect(text).toContain("threatmodel.md");
+    expect(option(text, "--export-format")).toContain("<format>");
+    expect(option(text, "--export-format")).toContain("sarif");
+    expect(text).toContain("--avit-template <file>");
+    for (const flag of [
+      "--format",
+      "--json",
+      "--filter-output",
+      "--full-output",
+      "--token-count",
+      "--token-limit",
+      "--token-offset",
+    ]) {
+      expect(option(text, flag)).toBe("");
+    }
+    const schema = await help(["export", "--schema", "--json"]);
+    expect(JSON.parse(schema)).toMatchObject({
+      options: {
+        properties: {
+          artifact: { enum: ["findings", "threat-model"], default: "findings" },
+          exportFormat: {
+            enum: ["csv", "json", "sarif", "md", "servicenow-avit"],
+          },
+        },
+      },
+    });
+  });
+
+  test("distinguishes JSON file import from JSON output", async () => {
+    const text = await help(["scan", "import", "--help"]);
+    expect(option(text, "--json")).toContain("--format json");
+    expect(option(text, "--input-format")).toContain("Input format");
+    expect(text.replace(/\s+/gu, " ")).toContain("--format json");
+    expect(option(text, "--format")).toContain("json");
+  });
+
+  test.each([
+    { args: ["-h"], usage: "codex-security <command>" },
+    { args: ["--help", "scan"], usage: "codex-security scan [repository]" },
+    {
+      args: ["scan", "--mode", "bogus", "--help"],
+      usage: "codex-security scan [repository]",
+    },
+    {
+      args: ["scan", "--config", "missing.yaml", "--help"],
+      usage: "codex-security scan [repository]",
+    },
+    {
+      args: ["scan", "import", "--json", "--help"],
+      usage: "codex-security scan import",
+    },
+    {
+      args: ["--format", "json", "scan", "import", "--help"],
+      usage: "codex-security scan import",
+    },
+    { args: ["scans", "--help"], usage: "codex-security scans [command]" },
+    {
+      args: ["findings", "--help"],
+      usage: "codex-security findings [command]",
+    },
+    { args: ["login", "status", "--help"], usage: "codex-security login" },
+  ])("preserves help routing for $args", async ({ args, usage }) => {
+    const text = await help(args);
+    expect(text).toContain(`Usage: ${usage}`);
+  });
+
+  test.each([
+    {
+      args: ["sacn", "--help"],
+      missing: "sacn",
+      recovery: "codex-security --help",
+    },
+    {
+      args: ["scans", "foo", "--help"],
+      missing: "scans foo",
+      recovery: "codex-security scans --help",
+    },
+  ])(
+    "identifies an unresolved help path $args",
+    async ({ args, missing, recovery }) => {
+      const out = capture();
+      const err = capture();
+      expect(await main(args, out.stream, err.stream, dependencies())).toBe(2);
+      expect(out.text()).toBe("");
+      expect(err.text()).toContain(missing);
+      expect(err.text()).toContain(recovery);
+    },
+  );
+
+  test.each([
+    ["imports", "--json"],
+    ["--json", "./import"],
+  ])(
+    "inspects repository scans with shared flags in either position (%s, %s)",
+    async (first, second) => {
+      const args = ["scan", first, second];
+      expect(await help([...args, "--help"])).toContain(
+        "Usage: codex-security scan [repository]",
+      );
+      const schema = JSON.parse(await help([...args, "--schema"]));
+      expect(schema.args.properties.repository.type).toBe("string");
+    },
+  );
+
+  test.each([
+    ["scans", "show"],
+    ["findings", "false-positive"],
+    ["scan", "import"],
+    ["login", "status"],
+    ["publish", "findings"],
+  ])("resolves %s %s around global options", async (group, verb) => {
+    const flags = ["--format", "json", "--schema"];
+    const expected = JSON.parse(await help([group, verb, ...flags]));
+    expect(JSON.parse(await help([group, ...flags, verb]))).toEqual(expected);
+  });
+
+  test.each(
+    [
+      ["bogus", "--llms-full"],
+      ["scans", "--json", "bogus", "--llms"],
+      ["mcp", "bogus", "--llms-full"],
+      ["info", "extra", "--help"],
+      ["info", "extra", "--schema"],
+      ["info", "extra", "--llms"],
+      ["completions", "zsh", "extra"],
+      ["completions", "zsh", "--", "--version"],
+      ["skills", "list", "--", "--no-global"],
+    ].map((args) => ({ args })),
+  )(
+    "rejects unknown discovery paths or surplus words (%j)",
+    async ({ args }) => {
+      const stdout = capture();
+      const stderr = capture();
+      expect(
+        await main(args, stdout.stream, stderr.stream, dependencies()),
+      ).toBe(2);
+      expect(stdout.text()).toBe("");
+      expect(stderr.text()).toMatch(
+        /Unknown command|not a command|Unexpected positional/,
+      );
+    },
+  );
+
+  test.each([
+    ["scans", "shwo", "show"],
+    ["mcp", "doctr", "doctor"],
+    ["skills", "lsit", "list"],
+  ])("preserves suggested verbs for %s %s", async (group, typo, verb) => {
+    const stderr = capture();
+    expect(
+      await main(
+        [group, typo],
+        capture().stream,
+        stderr.stream,
+        dependencies(),
+      ),
+    ).toBe(2);
+    expect(stderr.text()).toContain(`Did you mean '${verb}'?`);
+  });
+
+  test.each([
+    { command: [], expected: "Usage: codex-security" },
+    ...["skills", "mcp", "import", "publish", "completions"].map((name) => ({
+      command: [name],
+      expected: `Usage: codex-security ${name}`,
+    })),
+    { command: ["completions", "zsh"], expected: "#compdef" },
+  ])(
+    "formats the text from $command before applying JSON token controls",
+    async ({ command, expected }) => {
+      async function run(...flags: string[]) {
+        const { runCli, stdout, stderr } = createCliTest(main);
+        expect(await runCli([...command, ...flags], dependencies())).toBe(0);
+        expect(stderr.text()).toBe("");
+        return stdout.text();
+      }
+      const plain = await run();
+      expect(plain).toContain(expected);
+      expect(JSON.parse(await run("--json"))).toBe(plain);
+      const flags = ["--format=jsonl", "--full-output"];
+      expect(JSON.parse(await run(...flags))).toMatchObject({
+        ok: true,
+        data: plain,
+      });
+      expect(JSON.parse(await run(...flags, "--token-count"))).toBeGreaterThan(
+        0,
+      );
+      expect(JSON.parse(await run(...flags, "--token-limit=1"))).toMatchObject({
+        ok: true,
+        meta: { nextOffset: 1 },
+      });
+    },
+  );
+
+  test("uses the completion shell schema without generating a script", async () => {
+    const schema = JSON.parse(
+      await help(["completions", "--json", "--schema"]),
+    );
+    expect(schema.args.properties.shell.enum).toContain("zsh");
+  });
+
+  test.each(
+    [
+      ["scan", ".", "--dry-run", "--update"],
+      ["scans", "list", "--mcp"],
+      ["policy", "--full-output", "--mcp"],
+      ["--mcp", "--update"],
+      ["scan", ".", "--dry-run", "--incur-update-check"],
+    ].map((args) => ({ args })),
+  )("rejects mixed or private actions (%j)", async ({ args }) => {
+    const stdout = capture();
+    const stderr = capture();
+    expect(await main(args, stdout.stream, stderr.stream, dependencies())).toBe(
+      2,
+    );
+    expect(stdout.text()).toBe("");
+    expect(stderr.text()).toMatch(/must be used alone|Unknown flag/);
+  });
+
+  test.each(["--filter-output", "--format", "--token-limit", "--token-offset"])(
+    "%s cannot turn a following switch into a value and dispatch a write",
+    async (flag) => {
+      await using temp = await scopedTemporaryDirectory("cli-missing-global-");
+      const deps = dependencies({ currentDirectory: temp.path });
+      for (const next of [
+        "-h",
+        "--help",
+        "--version",
+        "--schema",
+        "--llms",
+        "--llms-full",
+        "--mcp",
+        "--update",
+        "--incur-update-check",
+        "--json",
+        "--full-output",
+        "-c",
+      ]) {
+        const stderr = capture();
+        expect(
+          await main(
+            [flag, next, "init", "new.yaml"],
+            capture().stream,
+            stderr.stream,
+            deps,
+          ),
+        ).toBe(2);
+        expect(stderr.text()).toMatch(
+          /Missing value|must be used alone|Unknown flag/,
+        );
+      }
+      expect(await readdir(temp.path)).toEqual([]);
+    },
+  );
+
+  test("the equals form keeps a dash-leading filter value literal", async () => {
+    await using temp = await scopedTemporaryDirectory("cli-explicit-filter-");
+    expect(
+      await main(
+        ["--filter-output=-h", "init", "new.yaml"],
+        capture().stream,
+        capture().stream,
+        dependencies({ currentDirectory: temp.path }),
+      ),
+    ).toBe(0);
+    expect(await readdir(temp.path)).toEqual(["new.yaml"]);
+  });
+
+  test("passes option-shaped filenames after -- through positional validation", async () => {
+    await using temp = await scopedTemporaryDirectory("cli-literal-args-");
+    const deps = dependencies({ currentDirectory: temp.path });
+    const stdout = capture();
+    const stderr = capture();
+    expect(
+      await main(
+        ["init", "--", "--version.yaml"],
+        stdout.stream,
+        stderr.stream,
+        deps,
+      ),
+    ).toBe(0);
+    expect(
+      await main(
+        ["--", "init", "--mcp.json"],
+        stdout.stream,
+        stderr.stream,
+        deps,
+      ),
+    ).toBe(0);
+    expect((await readdir(temp.path)).sort()).toEqual([
+      "--mcp.json",
+      "--version.yaml",
+    ]);
+    expect(
+      await main(
+        ["init", "--", "--version"],
+        stdout.stream,
+        stderr.stream,
+        deps,
+      ),
+    ).toBe(2);
+    expect(stderr.text()).toContain(".yaml");
+  });
+
+  test("links both file import routes and keeps the vendor preview copyable", async () => {
+    const menu = (await help(["import", "--help"])).replace(/\s+/gu, " ");
+    expect(menu).toContain("publish findings --help");
+    expect(menu).toContain("scan import --help");
+    expect(menu).toContain("publish-findings skill");
+    expect(menu).toContain("publish a stored import");
+    const vendor = await help(["publish", "findings", "--help"], 60);
+    const preview = vendor
+      .split("\n")
+      .find((line) => line.startsWith("  codex-security publish findings "));
+    for (const flag of [
+      "--provider",
+      "--source-key",
+      "--repository",
+      "--to",
+      "--dry-run",
+    ]) {
+      expect(preview).toContain(flag);
+    }
+  });
+
+  test("exposes the scan and its import child in both manifests", async () => {
+    for (const flag of ["--llms", "--llms-full"]) {
+      const manifest = JSON.parse(await help([flag, "--format", "json"]));
+      const names = manifest.commands.map(({ name }: { name: string }) => name);
+      expect(names.filter((name: string) => name === "scan")).toHaveLength(1);
+      expect(
+        names.filter((name: string) => name === "scan import"),
+      ).toHaveLength(1);
+    }
+  });
+
+  test("publishes runnable examples with the same flags in help and the full manifest", async () => {
+    const manifest = JSON.parse(
+      await help(["--llms-full", "--format", "json"]),
+    ) as {
+      commands: { name: string; examples?: { command: string }[] }[];
+    };
+    for (const [name, flags] of [
+      ["scan", ["--path src --path tests"]],
+      ["scan-components", ["--auto --plan-only", "--output-dir"]],
+      ["publish findings", ["--source-key", "--dry-run"]],
+    ] as const) {
+      const example = manifest.commands
+        .find((command) => command.name === name)
+        ?.examples?.find(({ command }) =>
+          flags.every((flag) => command.includes(flag)),
+        )?.command;
+      expect(example).toBeDefined();
+      expect(example).not.toMatch(
+        /--[a-z-]+[A-Z]|--(?:auto|plan-only|dry-run) true/u,
+      );
+      expect(await help([...name.split(" "), "--help"], 60)).toContain(
+        `  codex-security ${example}`,
+      );
+    }
+  });
+
+  test("completes scan import and its input format option from the command registry", async () => {
+    const previousShell = process.env["COMPLETE"];
+    const previousIndex = process.env["_COMPLETE_INDEX"];
+    try {
+      process.env["COMPLETE"] = "bash";
+      process.env["_COMPLETE_INDEX"] = "2";
+      expect((await help(["--", "cs", "scan", "im"])).trim()).toBe("import");
+      process.env["_COMPLETE_INDEX"] = "3";
+      expect(
+        (await help(["--", "cs", "scan", "import", "--input-f"])).trim(),
+      ).toBe("--input-format");
+    } finally {
+      if (previousShell === undefined) delete process.env["COMPLETE"];
+      else process.env["COMPLETE"] = previousShell;
+      if (previousIndex === undefined) delete process.env["_COMPLETE_INDEX"];
+      else process.env["_COMPLETE_INDEX"] = previousIndex;
+    }
+  });
+
+  test.each([
+    { command: ["mcp"] },
+    { command: ["mcp", "add"] },
+    { command: ["skills"] },
+    { command: ["skills", "list"] },
+    { command: ["completions"] },
+  ])("retains framework help for $command", async ({ command }) => {
+    const text = await help([...command, "--help"]);
+    expect(text).toContain(`Usage: codex-security ${command.join(" ")}`);
+    if (command[0] === "skills") {
+      expect(text).toMatch(
+        command.length === 1 ? /^Aliases: skill$/mu : /^Aliases: ls$/mu,
+      );
+    }
+    if (command[0] === "completions") {
+      for (const shell of ["bash", "fish", "nushell", "zsh"]) {
+        expect(text).toContain(shell);
+      }
+    }
+  });
+
+  test.each([60, 80])(
+    "wraps descriptions at %i columns without breaking examples",
+    async (columns) => {
+      for (const [command, examples] of [
+        [[], []],
+        [["scan"], [/^  codex-security scan \.(?:\s+#.*)?$/mu]],
+        [
+          ["login"],
+          [
+            /^    ssh -L 1455:localhost:1455 user@remote$/mu,
+            /^    codex-security login$/mu,
+          ],
+        ],
+        [["publish", "scan"], []],
+        [["scan", "import"], []],
+      ] as const) {
+        const text = await help([...command, "--help"], columns);
+        expect(text).not.toMatch(/\u001b\[/u);
+        for (const line of text.split("\n")) {
+          if (line.startsWith("  codex-security ")) continue;
+          const indent = line.length - line.trimStart().length;
+          const longestToken = Math.max(
+            ...line
+              .trim()
+              .split(/\s+/u)
+              .map((word) => word.length),
+          );
+          expect(line.length, line).toBeLessThanOrEqual(
+            Math.max(columns, indent + longestToken),
+          );
+        }
+        for (const example of examples) expect(text).toMatch(example);
+      }
+    },
+  );
+});
